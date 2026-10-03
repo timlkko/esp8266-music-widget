@@ -20,6 +20,7 @@ import logging
 import re
 import struct
 import sys
+import time
 import unicodedata
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -45,7 +46,12 @@ ALLOWED_APPS = [
     "pjibgcllelbfgfagdaldikeohf",  # Spotify (installed Chrome web app)
 ]
 
-IDLE_TITLE = "Nothing playing"
+IDLE_TITLE = "Nothing playing..."
+
+# If the allowed app stays paused/stopped longer than this many seconds, show the idle
+# screen. 0 = never: a paused track stays on the display as long as its window exists.
+PAUSE_TIMEOUT_SECONDS = 0
+TEXT_REFRESH_SECONDS = 10  # resend title/artist periodically in case the board rebooted
 # ------------------------------------------------------------------
 
 T_TITLE, T_ARTIST, T_TIME = 1, 2, 4
@@ -56,10 +62,17 @@ log = logging.getLogger("now_playing")
 
 
 # ----------------------------- helpers ----------------------------
+def app_dir() -> Path:
+    # When built with PyInstaller, __file__ points to a temp folder, so use the exe's folder
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
 def setup_logging():
-    # The log file lives next to the script and is capped in size
+    # The log file lives next to the script/exe and is capped in size
     handler = RotatingFileHandler(
-        Path(__file__).with_name("now_playing.log"),
+        app_dir() / "now_playing.log",
         maxBytes=200_000,
         backupCount=1,
         encoding="utf-8",
@@ -181,30 +194,61 @@ def send_text(ser, title: str, artist: str):
     ser.write(packet(T_ARTIST, safe_text(artist, 60)))
 
 
-def send_time(ser, pos: int, dur: int, playing: bool):
-    ser.write(packet(T_TIME, struct.pack("<HHB", pos, dur, 1 if playing else 0)))
+def send_time(ser, pos: int, dur: int, playing: bool, idle: bool = False):
+    flags = (1 if playing else 0) | (2 if idle else 0)
+    ser.write(packet(T_TIME, struct.pack("<HHB", pos, dur, flags)))
 
 
 async def run(ser: serial.Serial):
     mgr = await MediaManager.request_async()
     last_key = None
+    last_text_sent = 0.0
     idle_key = (IDLE_TITLE, "")
+    paused_since = None
+    errors = 0
 
     while True:
-        session = pick_session(mgr)
+        try:
+            now = time.monotonic()
+            session = pick_session(mgr)
 
-        if session is None:
-            if last_key != idle_key:
-                last_key = idle_key
-                send_text(ser, *idle_key)
-            send_time(ser, 0, 0, False)
-        else:
-            props = await session.try_get_media_properties_async()
-            key = (props.title or "", props.artist or "")
-            if key != last_key:
+            # Paused/stopped for too long (or a leftover session after the window
+            # was closed) is treated as "nothing playing"
+            if session is not None:
+                if is_playing(session):
+                    paused_since = None
+                else:
+                    if paused_since is None:
+                        paused_since = now
+                    if PAUSE_TIMEOUT_SECONDS and now - paused_since > PAUSE_TIMEOUT_SECONDS:
+                        session = None
+            else:
+                paused_since = None
+
+            if session is None:
+                key = idle_key
+            else:
+                # a WinRT call must never be able to hang the whole loop
+                props = await asyncio.wait_for(session.try_get_media_properties_async(), 5)
+                key = (props.title or "", props.artist or "")
+
+            if key != last_key or now - last_text_sent > TEXT_REFRESH_SECONDS:
                 last_key = key
+                last_text_sent = now
                 send_text(ser, *key)
-            send_time(ser, *get_times(session))
+
+            if session is None:
+                send_time(ser, 0, 0, False, idle=True)
+            else:
+                send_time(ser, *get_times(session))
+            errors = 0
+        except serial.SerialException:
+            raise  # let main() reconnect
+        except Exception:
+            errors += 1
+            log.exception("Media session error (%d)", errors)
+            if errors >= 5:
+                raise  # let main() restart everything, including the media manager
 
         await asyncio.sleep(POLL_SECONDS)
 

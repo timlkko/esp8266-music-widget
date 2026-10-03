@@ -1,27 +1,36 @@
-// ESP8266 + SSD1306 128x64 (I2C): track title, artist, time and progress.
-// Data arrives over Serial from the Python script.
+// ESP8266 + SSD1306 128x64 (I2C): title, artist, track time and progress.
+// Data comes over Serial from the PC Python script.
 //
-// Packet: AA 55 | type (1 byte) | length (2 bytes, little-endian) | data
-//   type 1 - title (UTF-8)
+// Packet: AA 55 | type (1 byte) | length (2 bytes, little-endian) | payload
+//   type 1 - title  (UTF-8)
 //   type 2 - artist (UTF-8)
-//   type 4 - time: position (uint16, sec) | duration (uint16, sec) | flags (bit0 = playing)
+//   type 4 - time: position (uint16, sec) | duration (uint16, sec) | flags
+//            flags: bit0 = playing, bit1 = idle (nothing to show)
+//
+// Stale data never stays on the screen:
+//   - no packets (PC off, script stopped) -> "No signal", then the OLED turns off
+//   - idle flag (music window closed / paused for long) -> "Nothing playing", then the OLED turns off
 
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <Wire.h>
 
-// ESP8266 defaults: SDA = D2 (GPIO4), SCL = D1 (GPIO5)
-// If you have an SH1106 instead of an SSD1306, switch to U8G2_SH1106_128X64_NONAME_F_HW_I2C
+// ESP8266 default I2C: SDA = D2 (GPIO4), SCL = D1 (GPIO5)
+// If you have an SH1106 instead of an SSD1306, use U8G2_SH1106_128X64_NONAME_F_HW_I2C
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 constexpr uint32_t BAUD = 460800;
 constexpr uint16_t MAX_PAYLOAD = 100;
 constexpr int SCREEN_W = 128;
-constexpr int GAP = 24;  // gap between repeats of the scrolling text
+constexpr int GAP = 24;  // gap between the two copies of a scrolling line
+
+constexpr uint32_t LINK_TIMEOUT_MS = 5000;   // no packets for this long -> "No signal"
+constexpr uint32_t SLEEP_AFTER_MS = 60000;   // no packets for this long -> OLED off
+constexpr uint32_t IDLE_SLEEP_MS = 30000;    // "idle" state for this long -> OLED off
 
 enum PacketType : uint8_t { T_TITLE = 1, T_ARTIST = 2, T_TIME = 4 };
 
-char title[96]  = "Waiting for the music...";
+char title[96] = "Waiting...";
 char artist[64] = "";
 int16_t titleOff = 0, artistOff = 0;
 
@@ -29,26 +38,54 @@ uint16_t posSec = 0, durSec = 0;
 bool playing = false;
 uint32_t timeRxMs = 0;
 
+uint32_t lastRxMs = 0;
+bool linkLost = false;
+bool asleep = false;
+bool idle = false;
+uint32_t idleSinceMs = 0;
+
 void handlePacket(uint8_t type, const uint8_t* d, uint16_t len) {
+  // any valid packet means the PC side is alive
+  lastRxMs = millis();
+  linkLost = false;
+
   switch (type) {
-    case T_TITLE:
+    case T_TITLE: {
       if (len > sizeof(title) - 1) len = sizeof(title) - 1;
-      memcpy(title, d, len);
-      title[len] = 0;
-      titleOff = 0;
+      char tmp[sizeof(title)];
+      memcpy(tmp, d, len);
+      tmp[len] = 0;
+      if (strcmp(tmp, title) != 0) {  // restart the scroll only when the text really changed
+        strcpy(title, tmp);
+        titleOff = 0;
+      }
       break;
-    case T_ARTIST:
+    }
+    case T_ARTIST: {
       if (len > sizeof(artist) - 1) len = sizeof(artist) - 1;
-      memcpy(artist, d, len);
-      artist[len] = 0;
-      artistOff = 0;
+      char tmp[sizeof(artist)];
+      memcpy(tmp, d, len);
+      tmp[len] = 0;
+      if (strcmp(tmp, artist) != 0) {
+        strcpy(artist, tmp);
+        artistOff = 0;
+      }
       break;
+    }
     case T_TIME:
       if (len == 5) {
         posSec = d[0] | (d[1] << 8);
         durSec = d[2] | (d[3] << 8);
         playing = d[4] & 1;
         timeRxMs = millis();
+
+        bool nowIdle = d[4] & 2;
+        if (nowIdle && !idle) idleSinceMs = millis();
+        idle = nowIdle;
+        if (!idle && asleep) {  // real music data wakes the screen up
+          u8g2.setPowerSave(0);
+          asleep = false;
+        }
       }
       break;
   }
@@ -60,7 +97,7 @@ void readSerial() {
   static uint8_t buf[MAX_PAYLOAD];
   static uint32_t lastByte = 0;
 
-  // if a packet was cut off, reset the parser
+  // if a packet got cut off, reset the parser
   if (state != 0 && millis() - lastByte > 300) state = 0;
 
   while (Serial.available()) {
@@ -104,7 +141,27 @@ void readSerial() {
   }
 }
 
-// Current position: between packets the time advances locally so it ticks smoothly
+// Watchdog for the PC link: stale data must not stay on the screen forever
+void checkLink() {
+  uint32_t silent = millis() - lastRxMs;
+
+  if (silent > LINK_TIMEOUT_MS && !linkLost) {
+    linkLost = true;
+    strcpy(title, "No signal");
+    artist[0] = 0;
+    titleOff = artistOff = 0;
+    posSec = durSec = 0;
+    playing = false;
+  }
+
+  bool idleTooLong = idle && (millis() - idleSinceMs > IDLE_SLEEP_MS);
+  if ((silent > SLEEP_AFTER_MS || idleTooLong) && !asleep) {
+    u8g2.setPowerSave(1);  // protects the OLED from burn-in
+    asleep = true;
+  }
+}
+
+// Current position: between packets the time runs locally so the seconds tick smoothly
 uint32_t currentPos() {
   uint32_t p = posSec;
   if (playing) p += (millis() - timeRxMs) / 1000;
@@ -117,7 +174,7 @@ void formatTime(char* out, size_t n, uint32_t sec) {
   else snprintf(out, n, "%u:%02u", (unsigned)(sec / 60), (unsigned)(sec % 60));
 }
 
-// Draws a string; if it doesn't fit on the screen, scrolls it in a loop
+// Draws a line; if it doesn't fit the screen, scrolls it in a loop
 void drawMarquee(const char* s, int y, int16_t& off) {
   int w = u8g2.getUTF8Width(s);
   if (w <= SCREEN_W) {
@@ -133,7 +190,7 @@ void drawMarquee(const char* s, int y, int16_t& off) {
 void draw() {
   u8g2.clearBuffer();
 
-  // title in a large font, artist smaller
+  // title big, artist smaller
   u8g2.setFont(u8g2_font_9x15_t_cyrillic);
   drawMarquee(title, 14, titleOff);
   u8g2.setFont(u8g2_font_6x12_t_cyrillic);
@@ -156,7 +213,7 @@ void draw() {
     u8g2.drawStr(SCREEN_W - u8g2.getStrWidth(buf), 62, buf);
   }
 
-  // play / pause icon in the center
+  // play / pause icon in the middle (shows the button you would press)
   if (playing) {
     u8g2.drawBox(61, 53, 2, 8);
     u8g2.drawBox(65, 53, 2, 8);
@@ -174,14 +231,16 @@ void setup() {
   u8g2.begin();
   u8g2.setBusClock(400000);
   u8g2.enableUTF8Print();
+  lastRxMs = millis();
   draw();
 }
 
 void loop() {
   readSerial();
+  checkLink();
 
   static uint32_t lastDraw = 0;
-  if (millis() - lastDraw >= 60) {
+  if (!asleep && millis() - lastDraw >= 60) {
     lastDraw = millis();
     draw();
   }
