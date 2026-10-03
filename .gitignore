@@ -10,10 +10,14 @@ __pycache__/
 .venv/
 venv/
 .env
+build/
+dist/
+*.spec
 
-# Секреты
+# Secrets
 secrets.h
 config.local.*
+*.log
 
 # ОС
 .DS_Store
