@@ -1,42 +1,74 @@
 """
-Sends the current track's title, artist and time to the board (Windows).
+Now-playing sender for the ESP8266 OLED widget (Windows).
 
-Install:  python -m pip install winsdk pyserial
-Run:      python now_playing.py
+Reads the current track (title, artist, position, duration) from the Windows
+media session of the allowed apps and sends it to the board over serial.
 
-Packet: AA 55 | type (1 byte) | length (2 bytes, little-endian) | data
-  type 1 - title (UTF-8)
+Install:   python -m pip install winsdk pyserial
+Run:       python now_playing.py
+Debug:     python now_playing.py --list     (shows media sessions and their app ids)
+Background: run with pythonw.exe (no console window), logs go to now_playing.log
+
+Packet: AA 55 | type (1 byte) | length (2 bytes, little-endian) | payload
+  type 1 - title  (UTF-8)
   type 2 - artist (UTF-8)
   type 4 - time: position (uint16, sec) | duration (uint16, sec) | flags (bit0 = playing)
 """
 
 import asyncio
+import logging
 import re
 import struct
 import sys
 import unicodedata
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import serial
+from serial.tools import list_ports
 from winsdk.windows.media.control import (
     GlobalSystemMediaTransportControlsSessionManager as MediaManager,
 )
 
-# ---------- settings ----------
-PORT = "COM6"          # board's COM port (check Device Manager)
+# ---------------------------- settings ----------------------------
+PORT = "COM6"          # board COM port; set to None to auto-detect CP210x/CH340/FTDI boards
 BAUD = 460800          # must match BAUD in the firmware
 POLL_SECONDS = 1.0
 
-# Which apps to listen to: substrings of the app id, case-insensitive.
-# Everything else (YouTube in another browser, any other players) is ignored.
-# To find your app ids:  python now_playing.py --list
+# Apps to listen to: substrings of the app id, case-insensitive.
+# Everything else (YouTube in a normal browser tab, other players) is ignored.
+# Find your ids with:  python now_playing.py --list
 # Empty list [] = listen to everything.
-ALLOWED_APPS = ["eikjhbkpemcmdeeeamdpkgabmk", "pjibgcllelbfgfagdaldikeohf"]  # SoundCloud and Spotify (installed Chrome web app)
-# --------------------------------
+ALLOWED_APPS = [
+    "eikjhbkpemcmdeeeamdpkgabmk",  # SoundCloud (installed Chrome web app)
+    "pjibgcllelbfgfagdaldikeohf",  # Spotify (installed Chrome web app)
+]
+
+IDLE_TITLE = "Nothing playing"
+# ------------------------------------------------------------------
 
 T_TITLE, T_ARTIST, T_TIME = 1, 2, 4
-NO_PLAYBACK = ("Nothing playing", "")
-PLAYING = 4  # PlaybackStatus.PLAYING value in Windows
+PLAYING = 4  # PlaybackStatus.PLAYING value in the Windows media API
+USB_UART_VIDS = {0x10C4, 0x1A86, 0x0403}  # CP210x, CH340, FTDI
+
+log = logging.getLogger("now_playing")
+
+
+# ----------------------------- helpers ----------------------------
+def setup_logging():
+    # The log file lives next to the script and is capped in size
+    handler = RotatingFileHandler(
+        Path(__file__).with_name("now_playing.log"),
+        maxBytes=200_000,
+        backupCount=1,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    log.addHandler(handler)
+    if sys.stderr is not None:  # under pythonw there is no console
+        log.addHandler(logging.StreamHandler())
+    log.setLevel(logging.INFO)
 
 
 def packet(ptype: int, payload: bytes) -> bytes:
@@ -44,8 +76,8 @@ def packet(ptype: int, payload: bytes) -> bytes:
 
 
 def clean_text(text: str) -> str:
-    """Converts "fancy" Unicode (gothic, bold, fullwidth, etc.) into plain letters
-    and drops characters that are missing from the display font."""
+    """Turn fancy Unicode (fraktur, bold, fullwidth...) into plain letters and
+    drop characters the display font cannot render."""
     original = text or ""
     text = unicodedata.normalize("NFKC", original)
     out = []
@@ -55,7 +87,7 @@ def clean_text(text: str) -> str:
             out.append(ch)
         elif ch.isspace():
             out.append(" ")
-        # everything else (emoji, CJK, decorations) is skipped
+        # everything else (emoji, CJK, decorative symbols) is skipped
     result = re.sub(r"\s+", " ", "".join(out)).strip()
     if not result and original.strip():
         return "?"
@@ -63,11 +95,21 @@ def clean_text(text: str) -> str:
 
 
 def safe_text(text: str, limit: int) -> bytes:
-    """Cleans the text and truncates UTF-8 by bytes without splitting a character."""
+    """Clean the text and cut it by bytes without splitting a UTF-8 character."""
     raw = clean_text(text).encode("utf-8")[:limit]
     return raw.decode("utf-8", "ignore").encode("utf-8")
 
 
+def resolve_port():
+    if PORT:
+        return PORT
+    for p in list_ports.comports():
+        if p.vid in USB_UART_VIDS:
+            return p.device
+    return None
+
+
+# ------------------------- media sessions -------------------------
 def app_id(session) -> str:
     return (session.source_app_user_model_id or "").lower()
 
@@ -87,7 +129,7 @@ def is_playing(session) -> bool:
 
 
 def pick_session(mgr):
-    """Takes only allowed apps; if there are several, prefers the one that is playing."""
+    """Only allowed apps are considered; if several, prefer the one that is playing."""
     allowed = [s for s in mgr.get_sessions() if is_allowed(s)]
     for s in allowed:
         if is_playing(s):
@@ -95,30 +137,17 @@ def pick_session(mgr):
     return allowed[0] if allowed else None
 
 
-async def list_sessions():
-    mgr = await MediaManager.request_async()
-    sessions = list(mgr.get_sessions())
-    if not sessions:
-        print("No active media sessions. Start some music and run again.")
-        return
-    for s in sessions:
-        p = await s.try_get_media_properties_async()
-        state = "playing" if is_playing(s) else "paused/stopped"
-        mark = "MATCH" if is_allowed(s) else "ignored"
-        print(f"[{mark}] app id: {s.source_app_user_model_id}  ({state})  {p.artist} - {p.title}")
-
-
 def get_times(session):
     """Returns (position_sec, duration_sec, playing)."""
     try:
         tl = session.get_timeline_properties()
-        playing = int(session.get_playback_info().playback_status) == PLAYING
+        playing = is_playing(session)
 
         start = tl.start_time.total_seconds()
         dur = max(0.0, tl.end_time.total_seconds() - start)
         pos = max(0.0, tl.position.total_seconds() - start)
 
-        # the player doesn't update the position every second, so add the elapsed time
+        # Players don't update the position every second, so add the elapsed time
         if playing:
             updated = tl.last_updated_time
             now = datetime.now(updated.tzinfo) if updated.tzinfo else datetime.now()
@@ -133,6 +162,20 @@ def get_times(session):
         return 0, 0, False
 
 
+async def list_sessions():
+    mgr = await MediaManager.request_async()
+    sessions = list(mgr.get_sessions())
+    if not sessions:
+        print("No active media sessions. Start some music and run this again.")
+        return
+    for s in sessions:
+        p = await s.try_get_media_properties_async()
+        state = "playing" if is_playing(s) else "paused/stopped"
+        mark = "ALLOWED" if is_allowed(s) else "ignored"
+        print(f"[{mark}] app id: {s.source_app_user_model_id}  ({state})  {p.artist} - {p.title}")
+
+
+# ----------------------------- sending ----------------------------
 def send_text(ser, title: str, artist: str):
     ser.write(packet(T_TITLE, safe_text(title, 90)))
     ser.write(packet(T_ARTIST, safe_text(artist, 60)))
@@ -145,14 +188,15 @@ def send_time(ser, pos: int, dur: int, playing: bool):
 async def run(ser: serial.Serial):
     mgr = await MediaManager.request_async()
     last_key = None
+    idle_key = (IDLE_TITLE, "")
 
     while True:
         session = pick_session(mgr)
 
         if session is None:
-            if last_key != NO_PLAYBACK:
-                last_key = NO_PLAYBACK
-                send_text(ser, *NO_PLAYBACK)
+            if last_key != idle_key:
+                last_key = idle_key
+                send_text(ser, *idle_key)
             send_time(ser, 0, 0, False)
         else:
             props = await session.try_get_media_properties_async()
@@ -166,18 +210,28 @@ async def run(ser: serial.Serial):
 
 
 async def main():
+    warned = False
     while True:
         try:
-            with serial.Serial(PORT, BAUD, timeout=1) as ser:
-                print(f"Connected to {PORT}")
-                await asyncio.sleep(2)  # the board resets when the port is opened
+            port = resolve_port()
+            if port is None:
+                raise serial.SerialException("no board found")
+            with serial.Serial(port, BAUD, timeout=1) as ser:
+                log.info("Connected to %s", port)
+                warned = False
+                await asyncio.sleep(2)  # the board resets when the port opens
                 await run(ser)
         except serial.SerialException as e:
-            print(f"Port unavailable ({e}), retrying in 3 s...")
-            await asyncio.sleep(3)
+            if not warned:  # don't spam the log while the board is unplugged
+                log.info("Port unavailable (%s), retrying...", e)
+                warned = True
+        except Exception:
+            log.exception("Unexpected error, restarting")
+        await asyncio.sleep(3)
 
 
 if __name__ == "__main__":
+    setup_logging()
     try:
         if "--list" in sys.argv:
             asyncio.run(list_sessions())
