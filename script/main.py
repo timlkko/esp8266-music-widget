@@ -31,8 +31,7 @@ POLL_SECONDS = 1.0
 # Everything else (YouTube in another browser, any other players) is ignored.
 # To find your app ids:  python now_playing.py --list
 # Empty list [] = listen to everything.
-ALLOWED_APPS = ["eikjhbkpemcmdeeeamdpkgabmk"]  # SoundCloud (installed Chrome web app)
-# To also add Spotify:  ["eikjhbkpemcmdeeeamdpkgabmk", "spotify"]
+ALLOWED_APPS = ["eikjhbkpemcmdeeeamdpkgabmk", "pjibgcllelbfgfagdaldikeohf"]  # SoundCloud and Spotify (installed Chrome web app)
 # --------------------------------
 
 T_TITLE, T_ARTIST, T_TIME = 1, 2, 4
