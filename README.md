@@ -2,8 +2,11 @@
 
 A small desk gadget that shows what's playing on your PC: title, artist, elapsed/total time and a progress bar on a 0.96" OLED. Long titles scroll, Cyrillic is supported.
 
-<!-- ![Widget photo](docs/photo.jpg) -->
+<p align="center">
+ 
+https://github.com/user-attachments/assets/185038a7-9b95-46d4-8a0d-9b5215fd21fc
 
+</p>
 A Python script on Windows reads the current track from the system media session and sends it over USB serial to an ESP8266, which draws it on the display. No Wi-Fi or accounts needed.
 
 ## You need
@@ -72,3 +75,7 @@ ALLOWED_APPS = ["spotify"]
 - **Stuck on "Waiting for the music...":** the script isn't running or `PORT` is wrong.
 - **"Nothing playing":** your player isn't in `ALLOWED_APPS`, run `--list`.
 - **"Port unavailable":** close any serial monitor that holds the port.
+
+## License
+
+MIT
