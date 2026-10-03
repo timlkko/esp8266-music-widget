@@ -75,7 +75,3 @@ ALLOWED_APPS = ["spotify"]
 - **Stuck on "Waiting for the music...":** the script isn't running or `PORT` is wrong.
 - **"Nothing playing":** your player isn't in `ALLOWED_APPS`, run `--list`.
 - **"Port unavailable":** close any serial monitor that holds the port.
-
-## License
-
-MIT
